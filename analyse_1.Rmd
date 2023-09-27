@@ -1,0 +1,1360 @@
+---
+title: "Projet Innovaction - analyse 1"
+author: "Allen Bush"
+date: "2023-06-27"
+output: html_document
+---
+
+This analysis focuses on the abundance of the three seedmaggot species in different crops as a function of time - to see if they have different phenologies
+The data in allium crops is more extensive and covers all years so I will start with these crops
+
+Load packages and data
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list=ls()) # clear workspace
+
+library(tidyverse)
+library(readxl)
+library(ggridges)
+library(patchwork)
+library(brms)
+library(cmdstanr)
+library(posterior)
+library(tidybayes)
+library(janitor)
+library(ggtext)
+library(scales)
+library(tidylog)
+
+abundance <- read_excel("BD_HRM_larves_oignon_2017_2022_mod.xlsx")
+```
+
+The abundance dataset was slightly pre-filtered in excel;
+I removed blanks, "serres" and "inconnu" from field IDs as I want to use field as a random effect
+
+#clean data 
+```{r}
+abundance <- abundance %>% 
+  clean_names() %>%
+  mutate(date = as.Date(date)) %>%
+  mutate(JJ = as.numeric(format(date, "%j")))
+
+str(abundance)
+
+abundance_short <- abundance %>%
+  group_by(producteur, champ, year, date, culture, famille, JJ) %>%
+  count(hrm_call)
+```
+
+number of fields visited
+
+```{r}
+n_fields  <- abundance_short %>%
+  group_by(year, culture) %>%
+  summarise(n= length(unique(champ))) %>%
+  ggplot(aes(x= year, y = n, fill= culture)) +
+  geom_bar(stat = "identity") +
+  scale_x_continuous(labels = c(2017:2022), breaks = c(2017:2022)) +
+  #scale_fill_manual(name = "Crop sampled", labels = c("Broccoli", "Brussel Sprouts", "Cabbage", "Cabbage/Broccoli mix", "Cauliflower", "unknown cruciferous mixture", "Radish", "Rutabaga", "Turnip"), values = c("yellowgreen", "khaki2", "thistle2", "mediumpurple2", "palevioletred4", "ivory3", "red2", "sienna1", "lemonchiffon2"))+
+  labs(y = "Number of fields visited",
+       x = "") +
+  #facet_wrap(~year) +
+  theme_classic() +
+  theme(axis.text = element_text(size = 12),
+        axis.title.y = element_text(size = 15),    
+        legend.text = element_text(size = 12,  margin = margin(0, 0, 0, 0)),
+        legend.title = element_text(size = 14,  margin = margin(0, 0, 0, 0)),
+        #legend.position = c(0.2, 0.8),
+        strip.text.x = element_text(size = 14, face = "bold"),
+        panel.spacing = unit(2, "lines"))
+
+n_fields
+```
+glimpse into species proportions
+```{r}
+sample_sizes <- abundance_short %>%
+  group_by(year, culture) %>%
+  summarise(n_fields= length(unique(champ)),
+            n_larvae = sum(n)) 
+
+number_samples <- abundance_short %>%
+  group_by(year, culture, champ) %>%
+  summarise(n_samples_field = length(unique(JJ))) %>%
+  group_by(year, culture) %>%
+  summarise(n_samples = sum(n_samples_field))
+
+relative_proportions <- ggplot()+
+  geom_col(data = abundance_short, aes(x = culture, y = n, fill = hrm_call), position = "fill")+
+  scale_fill_manual(name = expression(italic("Delia spp")), labels = c( "*D. platura* Lignée H", "*D. platura* Lignée N", "*D. florilega*"), values = c("slategray3","burlywood3", "indianred3"))+
+  geom_text(data = sample_sizes, aes(x = culture, y = -0.08), label = sample_sizes$n_fields)+
+  geom_text(data = number_samples, aes(x = culture, y = -0.17), label = number_samples$n_samples)+
+  geom_text(data = sample_sizes, aes(x = culture, y = -0.26), label = sample_sizes$n_larvae)+
+  geom_hline(yintercept = 0)+
+  geom_hline(yintercept = -0.12)+
+  geom_hline(yintercept = -0.21)+
+  coord_cartesian(ylim = c(-0.24,1.0))+
+  scale_y_continuous(breaks = c(-0.26, -0.17, -0.08, 0, 0.25, 0.5, 0.75, 1.0), labels = c("n larves", "n échantillons", "n champs", "0", "0.25", "0.5", "0.75", "1"))+
+  scale_x_discrete(labels =c("Échalote", "Maïs grain", "Maïs sucré" , "Oignon sec", "Oignon vert", "Soya" ))+
+  facet_wrap(~year) +
+  labs(y = "Proportion d'échantillons",
+       x = "") +
+  theme_classic() +
+  theme(axis.text = element_markdown(size = 11),
+        axis.title = element_text(size = 15),    
+        legend.text = element_markdown(size = 12),
+        legend.title = element_text(size = 14),
+        strip.text.x = element_text(size = 14, face = "bold"),
+        panel.spacing = unit(2, "lines"))
+
+
+
+
+relative_proportions
+```
+
+ggsave(filename = "relative_proportions.png", plot = relative_proportions, width = 20, height = 10)
+
+So the dataset is not all that huge and the two crops which appear to have enough data are green and dry onion. Otherwise, data is sparce
+My analysis plan is :
+1) compare species abundance across crops
+2) compare species abundance across crops and time
+
+Let's just take a look at the data for point 2)
+
+```{r}
+abundance %>%
+  ggplot(aes(x = JJ,  fill = hrm_call)) +
+  geom_histogram() +
+  facet_grid(year~culture)
+```
+
+Okay... Clearly, we will only be able to analyse green and dry onion for part 2 of the analysis
+
+# 1) compare species abundance across crops
+```{r}
+data_part_1 <- abundance_short %>%
+  mutate(hrm_call = as.factor(hrm_call),
+         JJ = as.numeric(JJ),
+         crop = as.factor(culture),
+         year = as.factor(year),
+         field_ID = as.factor(champ),
+         prod_ID = as.factor(producteur)
+         )
+ggplot(data_part_1) +
+  geom_histogram(aes(x = n)) # negative binomial should be good
+
+```
+
+I almost forgot!
+We need to add entries to the dataset for the species that were NOT collected! The data as is now has the abundance of the larvae that were collected only
+
+Try pivoting wider and than back to longer
+```{r}
+abundance_full <- abundance_short %>%
+  pivot_wider(names_from = hrm_call, values_from = n) %>% # this works - it creates columns for each species and adds NAs
+  rename(H = "2511",
+         N = "3453") %>%
+  mutate(H = as.numeric(coalesce(H , 0)),
+         N = as.numeric(coalesce(N , 0)),
+         florilega = as.numeric(coalesce(florilega , 0))) %>%
+  pivot_longer(cols = c(H, N, florilega), values_to = "abundance", names_to = "species") %>%
+  mutate(species = as.factor(species),
+         JJ = as.numeric(JJ),
+         crop = as.factor(culture),
+         year = as.factor(year),
+         field_ID = as.factor(champ),
+         prod_ID = as.factor(producteur)
+         ) %>%
+  ungroup()
+
+ggplot(abundance_full) +
+  geom_histogram(aes(x = abundance), binwidth = 1) # negative binomial should be good. Otherwise, go zero-inflated
+```
+
+
+
+
+Model
+
+priors
+```{r}
+bf_part_1 <- bf(abundance ~ 0 + species + crop + species*crop + (1|field_ID) + (1|year),
+                family = negbinomial(link = "log", link_shape = "log"))
+
+get_prior(bf_part_1, data = abundance_full)
+
+prior_part_1 <- c(
+  prior(normal(3,2), class = "b"),
+  prior(exponential(0.5), class = "sd"),
+  prior(gamma(0.01, 0.01), class = "shape")
+)
+
+sim_priors1 <- brm(formula = bf_part_1,
+                   data = abundance_full,
+                   prior = prior_part_1,
+                   sample_prior = "only",
+                   iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                   seed = 333, adapt_delta = 0.99, #there were a lot of divergent transitions so increasing adapt_delta is supposed to help
+                   backend = "cmdstanr")
+
+print(sim_priors1)
+
+abundance_full %>% 
+  add_predicted_draws(sim_priors1 , ndraws = 6) %>% 
+  ggplot(aes(x = abundance, y = .prediction)) + geom_point() + facet_wrap(~.draw)
+```
+Gamma(0.01, 0.01) does not seem like a good prior for the shape parameter
+
+```{r}
+ggplot(data = tibble(x = seq(from = 0, to = 60, by = 0.1)),
+       aes(x = x)) +
+  geom_ribbon(aes(ymin = 0, 
+                  ymax = dgamma(x, 0.01, 0.01))) 
+
+ggplot(data = tibble(x = seq(from = 0, to = 60, by = 1)),
+       aes(x = x)) +
+  geom_ribbon(aes(ymin = 0, 
+                  ymax = dnbinom(x, mu = 20, size = 0.1))) 
+```
+Size = 0.1 for the negativebinomial seems legit
+I think exponential(1) would actually be a better prior for the shape
+```{r}
+prior_part_1.2 <- c(
+  prior(normal(1,2), class = "b"),
+  prior(exponential(3), class = "sd"),
+  prior(exponential(2), class = "shape")
+)
+
+sim_priors1.2 <- brm(formula = bf_part_1,
+                   data = abundance_full,
+                   prior = prior_part_1.2,
+                   sample_prior = "only",
+                   iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                   seed = 333,
+                   backend = "cmdstanr")
+
+print(sim_priors1.2)
+
+plot(sim_priors1.2)
+
+abundance_full %>% 
+  add_predicted_draws(sim_priors1.2 , ndraws = 6) %>% 
+  ggplot(aes(x = abundance, y = .prediction)) + geom_point() + facet_wrap(~.draw)
+```
+
+In the code above, I ended up playing around with values for the three priors and this seems to be good enough
+
+Model the data
+
+```{r}
+mod1 <- brm(formula = bf_part_1,
+            data = abundance_full,
+            prior = prior_part_1.2,
+            iter = 2000, warmup = 1000, chains = 4, cores = 4,
+            seed = 333, control = list(adapt_delta = 0.9),
+            backend = "cmdstanr",
+            file = "mod_part_1")
+
+plot(mod1)
+
+print(mod1)
+
+
+
+pp_check(mod1, type = "dens_overlay", ndraws = 100)
+
+
+pp_check(mod1, type = "stat",stat = "median",  ndraws = 100)
+
+
+pp_check(mod1, type = "scatter_avg", ndraws = 100)
+
+
+pp_check(mod1, type = "ecdf_overlay", ndraws = 100)
+
+
+pp_check(mod1, type = "ribbon", ndraws = 100)
+```
+
+Predictions
+```{r}
+epreds1 <- abundance_full %>%
+  select(species, crop) %>%
+  distinct() %>%
+  add_epred_rvars(mod1, re_formula = NA)
+
+pred1 <- abundance_full%>%
+  select(species, crop) %>%
+  distinct() %>%
+  add_predicted_rvars(mod1, re_formula = NA)
+
+```
+
+
+Let's look at the distribution of predicted observations and the true observations
+
+```{r}
+ggplot(pred1) +
+  stat_gradientinterval(aes( x = crop, fill = species, color = species, ydist = .prediction), position = "dodge", fill_type = "gradient") +
+  geom_point(data = abundance_full, aes(y = abundance, x = crop, color = species), position = position_dodge(width=1.2), alpha = 0.2) +
+  theme_classic()
+```
+
+Model seems to slightly underpredict observations (as observed with pp_check) - might not be that bad
+
+let's look at the expected means
+
+```{r}
+ggplot(epreds1) +
+  stat_gradientinterval(aes( x = crop, fill = species, color = species, ydist = .epred), position = position_dodge(width=0.5), fill_type = "gradient") +
+  #geom_point(data = abundance_full, aes(y = abundance, x = crop, color = species), position = position_dodge(width=1.2), alpha = 0.2) +
+  coord_cartesian(ylim = c(0,15)) +
+  theme_classic()
+```
+
+Let's try multiple comparisons with marginaleffects
+
+```{r}
+library(marginaleffects)
+
+avg_comparisons(mod1, variables = "species", by ="crop", hypothesis = "pairwise")
+```
+
+Okay, this is cool but I'd like to do it by hand and be able to plot directly from rvars
+
+```{r}
+contrasts <- epreds1 %>%
+  pivot_wider(names_from = species, values_from = .epred) %>%
+  mutate(dif_h_n = H - N,
+         dif_h_florilega = H - florilega,
+         dif_n_florilega = N - florilega) %>%
+  pivot_longer(cols = c(dif_h_n, dif_h_florilega, dif_n_florilega))
+
+ggplot(contrasts)+
+  stat_slabinterval(aes( y = crop, color = name, xdist = value, fill = name), position = position_dodge(width = 0.8)) +
+  geom_vline(xintercept = 0, linetype = 2, alpha = 0.5) +
+  scale_fill_manual(name = "Comparaisons", labels = c( "*D. platura* lignée H vs. *D. florilega*", "*D. platura* lignée H vs *D. platura* lignée N", "*D. platura* lignée N vs. *D. florilega*"), values = c("orchid","goldenrod", "slategrey"))+
+  scale_color_manual(name = "Comparaisons", labels = c( "*D. platura* lignée H vs. *D. florilega*", "*D. platura* lignée H vs *D. platura* lignée N", "*D. platura* lignée N vs. *D. florilega*"), values = c("orchid","goldenrod", "slategrey"))+
+  labs(y = "",
+       x = "Différence  en abondance moyenne") +
+  theme_classic()+
+  theme(legend.text = element_markdown(size = 12))
+```
+
+I am starting to think that the underprediction is a problem.
+
+Let's re-do the analysis with only Allium crops and then with all crops but only for 2021
+
+# 1) Allium crops
+```{r}
+allium_data <-  abundance_short %>%
+  pivot_wider(names_from = hrm_call, values_from = n) %>% # this works - it creates columns for each species and adds NAs
+  rename(H = "2511",
+         N = "3453") %>%
+  mutate(H = as.numeric(coalesce(H , 0)),
+         N = as.numeric(coalesce(N , 0)),
+         florilega = as.numeric(coalesce(florilega , 0))) %>%
+  pivot_longer(cols = c(H, N, florilega), values_to = "abundance", names_to = "species") %>%
+  subset(famille == "allium") %>%
+  mutate(species = as.factor(species),
+         JJ = as.numeric(JJ),
+         crop = as.factor(culture),
+         year = as.factor(year),
+         field_ID = as.factor(champ),
+         prod_ID = as.factor(producteur)
+         ) %>%
+  ungroup()
+
+ggplot(allium_data) +
+  geom_histogram(aes(x = abundance), binwidth = 1)
+```
+
+```{r}
+allium_mod <- brm(formula = bf_part_1,
+                   data = allium_data,
+                   prior = prior_part_1.2,
+                   iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                   seed = 333, control = list(adapt_delta = 0.9),
+                   backend = "cmdstanr")
+plot(allium_mod)
+
+print(allium_mod)
+
+
+
+pp_check(allium_mod, type = "dens_overlay", ndraws = 100)
+
+
+pp_check(allium_mod, type = "stat",stat = "median",  ndraws = 100)
+
+
+pp_check(allium_mod, type = "scatter_avg", ndraws = 100)
+
+
+pp_check(allium_mod, type = "ecdf_overlay", ndraws = 100)
+
+
+pp_check(allium_mod, type = "ribbon", ndraws = 100)
+```
+
+Predictions
+```{r}
+allium_epred <- allium_data%>%
+  select(species, crop) %>%
+  distinct() %>%
+  add_epred_rvars(allium_mod, re_formula = NA)
+
+allium_pred <- allium_data %>%
+  select(species, crop) %>%
+  distinct() %>%
+  add_predicted_rvars(allium_mod, re_formula = NA)
+
+```
+
+
+Let's look at the distribution of predicted observations and the true observations
+
+```{r}
+ggplot(allium_pred) +
+  stat_gradientinterval(aes( x = crop, fill = species, color = species, ydist = .prediction), position = "dodge", fill_type = "gradient") +
+  geom_point(data = allium_data, aes(y = abundance, x = crop, color = species), position = position_dodge(width=1.2), alpha = 0.2) +
+  theme_classic()
+```
+
+let's look at the expected means
+
+```{r}
+ggplot(allium_epred ) +
+  stat_gradientinterval(aes( x = crop, fill = species, color = species, ydist = .epred), position = position_dodge(width=0.5), fill_type = "gradient") +
+  geom_point(data = allium_data, aes(y = abundance, x = crop, color = species), position = position_dodge(width=1.2), alpha = 0.2) +
+  coord_cartesian(ylim = c(0,15)) +
+  theme_classic()
+```
+
+I find it weird that the model expects such low means for oignon sec compared to echalotte..
+
+Let's take a look at what influence the random effects may have. Field_ID seems to have high variance
+
+Predictions with random effects
+```{r}
+allium_epred_random <- allium_data%>%
+  select(species, crop, year, field_ID) %>%
+  distinct() %>%
+  add_epred_rvars(allium_mod, re_formula = NULL)
+
+allium_pred_random <- allium_data %>%
+  select(species, crop, year, field_ID) %>%
+  distinct() %>%
+  add_predicted_rvars(allium_mod, re_formula = NULL)
+
+```
+
+Let's look at the distribution of predicted observations and the true observations
+
+```{r}
+ggplot(allium_pred_random) +
+  stat_gradientinterval(aes( x = species, fill = field_ID, color = field_ID, ydist = .prediction), position = "dodge", fill_type = "gradient") +
+  geom_point(data = allium_data, aes(y = abundance, x = species, color = field_ID), position = position_dodge(width=1.2), alpha = 0.2) +
+  theme_classic() +
+  theme(legend.position = "none")+
+  facet_wrap(~year, scales = "free")
+```
+
+Predictions excluding year
+
+```{r}
+allium_pred_field <- allium_data %>%
+  select(species, crop, field_ID) %>%
+  distinct() %>%
+  add_predicted_rvars(allium_mod, re_formula = ~(1|field_ID))
+
+ggplot(allium_pred_field) +
+  stat_gradientinterval(aes( x = species, fill = field_ID, color = field_ID, ydist = .prediction), position = "dodge", fill_type = "gradient") +
+  geom_point(data = allium_data, aes(y = abundance, x = species, color = field_ID), position = position_dodge(width=1.2), alpha = 0.2) +
+  theme_classic() +
+  coord_cartesian(ylim = c(0,50)) +
+  theme(legend.position = "none")
+```
+
+
+
+```{r}
+allium_data %>%
+  group_by(crop, species) %>%
+  summarise(avg = mean(abundance))
+```
+
+Raw averages are low so I think my model predictions fit okay
+
+As of 03/07/23 I think that since the counts are low and don't seem all that dispersed, a Poisson model might actually fit better
+Also, I think the contrast plots would be more informative if they were on the log scale - since the number of larvae collected do not reflect a sample of the population (scouts don't collect all the larvae they stumble upon, only a few so they don't lose too much time), it makes more sense to display % difference rather than absolute differences in abundance. If one species has one more larvae than another species on average, that does not mean much
+
+#Poisson model
+prior predictive check
+```{r}
+bf_poisson <- bf(abundance ~ 0 + species + crop + species*crop + (1|field_ID) + (1|year),
+                family = poisson(link = "log"))
+
+get_prior(bf_poisson, data = abundance_full)
+
+prior_poisson <- c(
+  prior(normal(0,2), class = "b"),
+  prior(exponential(1), class = "sd")
+)
+
+sim_priors_poisson <- brm(formula = bf_poisson,
+                   data = abundance_full,
+                   prior = prior_poisson,
+                   sample_prior = "only",
+                   iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                   seed = 333,
+                   backend = "cmdstanr")
+
+
+abundance_full %>% 
+  add_predicted_draws(sim_priors_poisson , ndraws = 6) %>% 
+  ggplot(aes(x = abundance, y = .prediction)) + geom_point() + facet_wrap(~.draw, scales = "free")
+```
+
+Predicted observations fluctate a lot but make some sense
+
+Model 
+
+```{r}
+poisson_mod <- brm(formula = bf_poisson,
+                   data = abundance_full,
+                   prior = prior_poisson,
+                   iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                   seed = 333, control = list(adapt_delta = 0.99),
+                   backend = "cmdstanr")
+
+print(poisson_mod)
+
+
+
+pp_check(poisson_mod, type = "dens_overlay", ndraws = 100)
+
+
+pp_check(poisson_mod, type = "stat",stat = "median",  ndraws = 100)
+
+
+pp_check(poisson_mod, type = "scatter_avg", ndraws = 100)
+
+
+pp_check(poisson_mod, type = "ecdf_overlay", ndraws = 100)
+
+
+pp_check(poisson_mod, type = "ribbon", ndraws = 100)
+```
+
+The poisson model actually fits worse than the negbinomial
+
+The negbinomial will have to do
+
+Now, let's contrast log abundance
+
+# Part 1 graphs for Report
+predictions on log scale
+```{r}
+lin_pred1 <- abundance_full%>%
+  select(species, crop) %>%
+  distinct() %>%
+  add_linpred_rvars(mod1, re_formula = NA)
+```
+
+contrasts
+```{r}
+linpred_contrasts <- lin_pred1 %>%
+  pivot_wider(names_from = species, values_from = .linpred) %>%
+  mutate(dif_h_n = H - N,
+         dif_h_florilega = H - florilega,
+         dif_n_florilega = N - florilega) %>%
+  pivot_longer(cols = c(dif_h_n, dif_h_florilega, dif_n_florilega))
+
+contrasts_part_1 <- ggplot(linpred_contrasts)+
+  stat_slabinterval(aes( y = crop, color = name, xdist = value, fill = name), position = position_dodge(width = 0.8)) +
+  geom_vline(xintercept = 0, linetype = 2, alpha = 0.5) +
+  scale_fill_manual(name = "Comparaisons", labels = c( "*D. platura* lignée H vs. *D. florilega*", "*D. platura* lignée H vs. *D. platura* lignée N", "*D. platura* lignée N vs. *D. florilega*"), values = c("orchid","goldenrod", "slategrey"), guide = guide_legend(reverse = TRUE))+
+  scale_color_manual(name = "Comparaisons", labels = c( "*D. platura* lignée H vs. *D. florilega*", "*D. platura* lignée H vs. *D. platura* lignée N", "*D. platura* lignée N vs. *D. florilega*"), values = c("orchid","goldenrod", "slategrey"), guide = guide_legend(reverse = TRUE))+
+  scale_x_continuous(breaks = seq(from = -2, to = 2, by = 0.25), labels = percent)+
+  coord_cartesian(xlim = c(-2.2, 2.2)) +
+  scale_y_discrete(labels = c("Oignon sec", "Oignon vert", "Soya", "Maïs grain", "Maïs sucré", "Échalotte"))+
+  labs(y = "",
+       x = "Pourcentage de différence en abondance") +
+  theme_classic()+
+  theme(legend.text = element_markdown(size = 12),
+        legend.title = element_text(size = 12),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        legend.position = c(0.15, 0.44))
+```
+
+
+
+ggsave(filename = "contrasts_part_1.png", plot = contrasts_part_1, width = 20, height = 10)
+
+
+
+Mean abundance
+```{r}
+mean_abundance <- ggplot(epreds1) +
+  stat_gradientinterval(aes( x = crop, fill = species, color = species, ydist = .epred), position = position_dodge(width=1), .width = c(0.5, 0.95)) +
+  scale_fill_manual(name = expression(italic("Delia spp")), labels = c( "*D. platura* Lignée H", "*D. platura* Lignée N", "*D. florilega*"), values = c("slategray3","burlywood3", "indianred3"))+
+  scale_color_manual(name = expression(italic("Delia spp")), labels = c( "*D. platura* Lignée H", "*D. platura* Lignée N", "*D. florilega*"), values = c("slategray3","burlywood3", "indianred3"))+
+  coord_cartesian(ylim = c(0,10)) +
+  scale_x_discrete(labels = c("Oignon sec", "Oignon vert", "Soya", "Maïs grain", "Maïs sucré", "Échalotte"))+
+  scale_y_continuous(breaks = seq(from = 1, to = 10, by = 1)) +
+  labs(y = "Abondance moyenne",
+       x = "") +
+  theme_classic()+
+  theme(legend.text = element_markdown(size = 12),
+        legend.title = element_text(size = 12),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        legend.position = c(0.15, 0.75))
+
+```
+
+
+ggsave(filename = "mean_abundance_part_1.png", plot = mean_abundance, width = 15, height = 8)
+
+
+
+
+# Part 2) compare species abundance across crops and time
+
+subset oignon sec and vert
+```{r}
+oig_data <- abundance_full %>%
+  mutate(culture = as.character(culture),
+         species = as.character(species),
+         crop = as.character(crop),
+         field_ID = as.character(field_ID),
+         year = as.character(year),
+         prod_ID = as.character(prod_ID)) %>%
+  subset(culture %in% c("oignon_sec", "oignon_vert")) %>%
+  mutate(culture = as.factor(culture),
+         species = as.factor(species),
+         crop = as.factor(crop),
+         field_ID = as.factor(field_ID),
+         year = as.factor(year),
+         prod_ID = as.factor(prod_ID))
+
+str(oig_data)
+```
+
+Data viz
+```{r}
+ggplot(data = oig_data, aes(x = JJ, y = abundance, color = species)) +
+  geom_smooth( method = "loess") +
+  geom_point() +
+  coord_cartesian(ylim = c(0, 30))+
+  facet_wrap(~culture)
+```
+Separate dataset by crop
+```{r}
+oig_sec_data <- oig_data %>%
+  mutate(culture = as.character(culture),
+         species = as.character(species),
+         crop = as.character(crop),
+         field_ID = as.character(field_ID),
+         year = as.character(year),
+         prod_ID = as.character(prod_ID)) %>%
+  subset(culture == "oignon_sec") %>%
+  mutate(culture = as.factor(culture),
+         species = as.factor(species),
+         crop = as.factor(crop),
+         field_ID = as.factor(field_ID),
+         year = as.factor(year),
+         prod_ID = as.factor(prod_ID))
+
+oig_vert_data <- oig_data %>%
+  mutate(culture = as.character(culture),
+         species = as.character(species),
+         crop = as.character(crop),
+         field_ID = as.character(field_ID),
+         year = as.character(year),
+         prod_ID = as.character(prod_ID)) %>%
+  subset(culture == "oignon_vert") %>%
+  mutate(culture = as.factor(culture),
+         species = as.factor(species),
+         crop = as.factor(crop),
+         field_ID = as.factor(field_ID),
+         year = as.factor(year),
+         prod_ID = as.factor(prod_ID))
+```
+
+
+Model
+
+prior predictive checks
+oignon vert
+```{r}
+smooth_bf <- bf(abundance ~ 0 + s(JJ, by = species) + (1|field_ID) + (1|year) + (1|prod_ID),
+                family = negbinomial(link = "log"))
+
+get_prior(smooth_bf, data = oig_vert_data)
+
+prior_smooth <- c(
+  prior(normal(1,2), class = "b"),
+  prior(exponential(3), class = "sd"),
+  prior(exponential(2), class = "shape"),
+  prior(exponential(0.5), class = "sds")
+)
+
+sim_priors_smooth_vert <- brm(formula = smooth_bf,
+                   data = oig_vert_data,
+                   prior = prior_smooth,
+                   sample_prior = "only",
+                   iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                   seed = 333, control = list(adapt_delta = 0.99),
+                   backend = "cmdstanr")
+
+
+oig_vert_data %>% 
+  add_predicted_draws(sim_priors_smooth_vert , ndraws = 6) %>% 
+  ggplot(aes(x = abundance, y = .prediction)) + geom_point() + facet_wrap(~.draw, scales = "free")
+```
+
+seems fine
+
+
+oignon sec
+```{r}
+smooth_bf <- bf(abundance ~ 0 + s(JJ, by = species) + (1|field_ID) + (1|year) + (1|prod_ID),
+                family = negbinomial(link = "log"))
+
+
+sim_priors_smooth_sec <- brm(formula = smooth_bf,
+                   data = oig_sec_data,
+                   prior = prior_smooth,
+                   sample_prior = "only",
+                   iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                   seed = 333, control = list(adapt_delta = 0.99),
+                   backend = "cmdstanr")
+
+
+oig_sec_data %>% 
+  add_predicted_draws(sim_priors_smooth_sec , ndraws = 6) %>% 
+  ggplot(aes(x = abundance, y = .prediction)) + geom_point() + facet_wrap(~.draw, scales = "free")
+```
+seems fine
+
+
+
+Model data
+
+oignon vert
+```{r}
+mod_smooth_vert <- brm(formula = smooth_bf,
+                   data = oig_vert_data,
+                   prior = prior_smooth,
+                   iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                   seed = 333, control = list(adapt_delta = 0.99),
+                   backend = "cmdstanr",
+                   file = "mod_smooth_vert")
+
+print(mod_smooth_vert)
+
+plot(mod_smooth_vert)
+
+pp_check(mod_smooth_vert, type = "dens_overlay", ndraws = 100)
+
+
+pp_check(mod_smooth_vert, type = "stat",stat = "median",  ndraws = 100)
+
+
+pp_check(mod_smooth_vert, type = "scatter_avg", ndraws = 100)
+
+
+pp_check(mod_smooth_vert, type = "ecdf_overlay", ndraws = 100)
+
+
+pp_check(mod_smooth_vert, type = "ribbon", ndraws = 100)
+```
+
+The model seems to fit I think... Overpredicts maybe a bit
+
+Let's look at the predictions
+
+predicted mean
+```{r}
+smooth_epred_vert <- oig_vert_data%>%
+  select(species) %>%
+  distinct() %>%
+  expand_grid(JJ = seq(from = min(oig_vert_data$JJ), to = max(oig_vert_data$JJ), by = 5)) %>%
+  add_epred_rvars(mod_smooth_vert, re_formula = NA)
+
+
+ggplot() +
+  stat_lineribbon(data = smooth_epred_vert, aes(ydist = .epred, x = JJ, color = species, fill = species), alpha = 0.3) +
+  geom_point(data = oig_vert_data, aes(x = JJ, y = abundance, color = species, fill = species)) +
+  coord_cartesian(ylim = c(0, 15)) +
+  scale_x_continuous(breaks = seq(from = 120, to = 250, by = 10))+
+  theme_classic()
+
+
+```
+
+After talking with A-M on 05-07-2023; we can cut at JJ <= 190 (like oignon sec)
+
+```{r}
+
+oig_vert_subset <- subset(oig_vert_data, JJ <= 190)
+
+mod_smooth_vert_subset <- brm(formula = smooth_bf,
+                   data = oig_vert_subset,
+                   prior = prior_smooth,
+                   iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                   seed = 333, control = list(adapt_delta = 0.99),
+                   backend = "cmdstanr",
+                   file = "mod_smooth_vert_subset")
+
+print(mod_smooth_vert_subset)
+
+plot(mod_smooth_vert_subset)
+
+pp_check(mod_smooth_vert_subset, type = "dens_overlay", ndraws = 100)
+
+
+pp_check(mod_smooth_vert_subset, type = "stat",stat = "median",  ndraws = 100)
+
+
+pp_check(mod_smooth_vert_subset, type = "scatter_avg", ndraws = 100)
+
+
+pp_check(mod_smooth_vert_subset, type = "ecdf_overlay", ndraws = 100)
+
+
+pp_check(mod_smooth_vert_subset, type = "ribbon", ndraws = 100)
+```
+
+predicted mean
+```{r}
+smooth_epred_vert_subset <- oig_vert_subset%>%
+  select(species) %>%
+  distinct() %>%
+  expand_grid(JJ = seq(from = min(oig_vert_subset$JJ), to = max(oig_vert_subset$JJ), by = 5)) %>%
+  add_epred_rvars(mod_smooth_vert_subset, re_formula = NA)
+
+
+ggplot() +
+  stat_lineribbon(data = smooth_epred_vert_subset, aes(ydist = .epred, x = JJ, color = species, fill = species), alpha = 0.3) +
+  geom_point(data = oig_vert_subset, aes(x = JJ, y = abundance, color = species, fill = species)) +
+  coord_cartesian(ylim = c(0, 15)) +
+  scale_x_continuous(breaks = seq(from = 120, to = 250, by = 10))+
+  theme_classic()
+
+
+```
+
+A lot better
+
+oignon sec
+```{r}
+mod_smooth_sec <- brm(formula = smooth_bf,
+                   data = oig_sec_data,
+                   prior = prior_smooth,
+                   iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                   seed = 333, control = list(adapt_delta = 0.99),
+                   backend = "cmdstanr",
+                   file = "mod_smooth_sec")
+
+print(mod_smooth_sec)
+
+plot(mod_smooth_sec)
+
+pp_check(mod_smooth_sec, type = "dens_overlay", ndraws = 100)
+
+
+pp_check(mod_smooth_sec, type = "stat",stat = "median",  ndraws = 100)
+
+
+pp_check(mod_smooth_sec, type = "scatter_avg", ndraws = 100)
+
+
+pp_check(mod_smooth_sec, type = "ecdf_overlay", ndraws = 100)
+
+
+pp_check(mod_smooth_sec, type = "ribbon", ndraws = 100)
+```
+
+predicted mean
+```{r}
+smooth_epred_sec <- oig_sec_data%>%
+  select(species) %>%
+  distinct() %>%
+  expand_grid(JJ = seq(from = min(oig_sec_data$JJ), to = max(oig_sec_data$JJ), by = 5)) %>%
+  add_epred_rvars(mod_smooth_sec, re_formula = NA)
+
+
+ggplot() +
+  stat_lineribbon(data = smooth_epred_sec, aes(ydist = .epred, x = JJ, color = species, fill = species), alpha = 0.3) +
+  geom_point(data = oig_sec_data, aes(x = JJ, y = abundance, color = species, fill = species)) +
+  coord_cartesian(ylim = c(0, 15)) +
+  scale_x_continuous(breaks = seq(from = 120, to = 250, by = 10))+
+  theme_classic()
+
+
+```
+
+It seems like the curves would make more sense if we took out the data after JJ = 190 since we focus on the first generation
+
+Oignon sec model JJ <= 190 
+
+```{r}
+oig_sec_subset <- subset(oig_sec_data, JJ <= 190)
+
+mod_smooth_sec_subset_good <- brm(formula = smooth_bf,
+                   data = oig_sec_subset,
+                   prior = prior_smooth,
+                   iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                   seed = 333, control = list(adapt_delta = 0.99),
+                   backend = "cmdstanr",
+                   file = "mod_smooth_sec_subset_good")
+
+print(mod_smooth_sec_subset_good)
+
+plot(mod_smooth_sec_subset_good)
+
+pp_check(mod_smooth_sec_subset_good, type = "dens_overlay", ndraws = 100)
+
+
+pp_check(mod_smooth_sec_subset_good, type = "stat",stat = "median",  ndraws = 100)
+
+
+pp_check(mod_smooth_sec_subset_good, type = "scatter_avg", ndraws = 100)
+
+
+pp_check(mod_smooth_sec_subset_good, type = "ecdf_overlay", ndraws = 100)
+
+
+pp_check(mod_smooth_sec_subset_good, type = "ribbon", ndraws = 100)
+```
+
+
+predicted mean
+```{r}
+smooth_epred_sec_subset <- oig_sec_subset%>%
+  select(species) %>%
+  distinct() %>%
+  expand_grid(JJ = seq(from = min(oig_sec_subset$JJ), to = max(oig_sec_subset$JJ), by = 5)) %>%
+  add_epred_rvars(mod_smooth_sec_subset_good, re_formula = NA)
+
+
+ggplot() +
+  stat_lineribbon(data = smooth_epred_sec_subset, aes(ydist = .epred, x = JJ, color = species, fill = species), alpha = 0.3) +
+  geom_point(data = oig_sec_subset, aes(x = JJ, y = abundance, color = species, fill = species)) +
+  coord_cartesian(ylim = c(0, 15)) +
+  scale_x_continuous(breaks = seq(from = 120, to = 190, by = 10))+
+  theme_classic()
+
+
+```
+
+After talking with A-M on 05-07-2023; we should add prod ID as a random intercept to the model in part one
+
+# Add prod_ID to part 1 model
+
+```{r}
+bf_part_1_good <- bf(abundance ~ 0 + species + crop + species*crop + (1|field_ID) + (1|year) + (1|prod_ID),
+                family = negbinomial(link = "log", link_shape = "log"))
+
+prior_part_1.2 <- c(
+  prior(normal(1,2), class = "b"),
+  prior(exponential(3), class = "sd"),
+  prior(exponential(2), class = "shape")
+)
+
+mod1_good <- brm(formula = bf_part_1_good,
+            data = abundance_full,
+            prior = prior_part_1.2,
+            iter = 2000, warmup = 1000, chains = 4, cores = 4,
+            seed = 333, control = list(adapt_delta = 0.9),
+            backend = "cmdstanr",
+            file = "mod1_good")
+
+plot(mod1_good)
+
+print(mod1_good)
+
+
+
+pp_check(mod1_good, type = "dens_overlay", ndraws = 100)
+
+
+pp_check(mod1_good, type = "stat",stat = "median",  ndraws = 100)
+
+
+pp_check(mod1_good, type = "scatter_avg", ndraws = 100)
+
+
+pp_check(mod1_good, type = "ecdf_overlay", ndraws = 100)
+
+
+pp_check(mod1_good, type = "ribbon", ndraws = 100)
+```
+
+# Part 1 graphs for Report good
+
+Predictions
+```{r}
+epreds1.2 <- abundance_full%>%
+  select(species, crop) %>%
+  distinct() %>%
+  add_epred_rvars(mod1_good, re_formula = NA) %>%
+  mutate(crop = factor(crop, levels = c("oignon_sec", "oignon_vert", "echalote", "soya", "mais_grain", "mais_sucre")))
+
+lin_pred1.2 <- abundance_full%>%
+  select(species, crop) %>%
+  distinct() %>%
+  add_linpred_rvars(mod1_good, re_formula = NA)%>%
+  mutate(crop = factor(crop, levels = c("oignon_sec", "oignon_vert", "echalote", "soya", "mais_grain", "mais_sucre")))
+
+
+```
+
+Mean abundance
+```{r}
+mean_abundance <- ggplot(epreds1.2) +
+  stat_gradientinterval(aes( x = crop, fill = species, color = species, ydist = .epred), position = position_dodge(width=1), .width = c(0.5, 0.95)) +
+  scale_fill_manual(name = expression(italic("Delia spp")), labels = c( "*D. florilega*", "*D. platura* Lignée H", "*D. platura* Lignée N"), values = c("slategray3","burlywood3", "indianred3"))+
+  scale_color_manual(name = expression(italic("Delia spp")), labels = c( "*D. florilega*", "*D. platura* Lignée H", "*D. platura* Lignée N"), values = c("slategray3","burlywood3", "indianred3"))+
+  coord_cartesian(ylim = c(0,10)) +
+  scale_x_discrete(labels = c("Oignon sec", "Oignon vert", "Échalote", "Soya", "Maïs grain", "Maïs sucré"))+
+  scale_y_continuous(breaks = seq(from = 1, to = 10, by = 1)) +
+  labs(y = "Abondance moyenne",
+       x = "") +
+  theme_classic()+
+  theme(legend.text = element_markdown(size = 12),
+        legend.title = element_text(size = 12),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        legend.position = c(0.15, 0.75))
+
+mean_abundance
+```
+
+
+ggsave(filename = "mean_abundance_part_1.png", plot = mean_abundance, width = 15, height = 8)
+
+contrasts
+```{r}
+linpred_contrasts <- lin_pred1.2 %>%
+  pivot_wider(names_from = species, values_from = .linpred) %>%
+  mutate(dif_h_n = H - N,
+         dif_h_florilega = H - florilega,
+         dif_n_florilega = N - florilega) %>%
+  pivot_longer(cols = c(dif_h_n, dif_h_florilega, dif_n_florilega))
+
+contrasts_part_1 <- ggplot(linpred_contrasts)+
+  stat_slabinterval(aes( y = crop, color = name, xdist = value, fill = name), position = position_dodge(width = 0.8)) +
+  geom_vline(xintercept = 0, linetype = 2, alpha = 0.5) +
+  scale_fill_manual(name = "Comparaisons", labels = c( "*D. platura* lignée H vs. *D. florilega*", "*D. platura* lignée H vs. *D. platura* lignée N", "*D. platura* lignée N vs. *D. florilega*"), values = c("orchid","goldenrod", "slategrey"), guide = guide_legend(reverse = TRUE))+
+  scale_color_manual(name = "Comparaisons", labels = c( "*D. platura* lignée H vs. *D. florilega*", "*D. platura* lignée H vs. *D. platura* lignée N", "*D. platura* lignée N vs. *D. florilega*"), values = c("orchid","goldenrod", "slategrey"), guide = guide_legend(reverse = TRUE))+
+  scale_x_continuous(breaks = seq(from = -2, to = 2, by = 0.25), labels = percent)+
+  coord_cartesian(xlim = c(-2.2, 2.2)) +
+ scale_y_discrete(labels = c("Oignon sec", "Oignon vert", "Échalote", "Soya", "Maïs grain", "Maïs sucré"))+
+  labs(y = "",
+       x = "Pourcentage de différence en abondance") +
+  theme_classic()+
+  theme(legend.text = element_markdown(size = 15),
+        legend.title = element_text(size = 15),
+        axis.text = element_text(size = 15),
+        axis.title = element_text(size = 15),
+        legend.position = c(0.15, 0.61))
+
+contrasts_part_1
+```
+
+
+
+ggsave(filename = "contrasts_part_1.png", plot = contrasts_part_1, width = 20, height = 10)
+
+
+Abundance in OIG sec & vert across years
+
+```{r}
+
+epreds_years <- expand_grid(
+  crop = c("oignon_sec", "oignon_vert"),
+  species = c("H", "N", "florilega"),
+  year = c(2017:2022)
+) %>%
+  add_epred_rvars(mod1_good, re_formula = ~(1|year)) %>%
+  mutate(year = factor(year, levels = c("2017", "2018", "2019", "2020", "2021", "2022")))
+
+
+
+mean_abundance_year <- ggplot(epreds_years) +
+  stat_gradientinterval(aes( x = crop, fill = species, color = species, ydist = .epred), position = position_dodge(width=1), .width = c(0.5, 0.95)) +
+  scale_fill_manual(name = expression(italic("Delia spp")), labels = c( "*D. florilega*", "*D. platura* Lignée H", "*D. platura* Lignée N"), values = c("slategray3","burlywood3", "indianred3"))+
+  scale_color_manual(name = expression(italic("Delia spp")), labels = c( "*D. florilega*", "*D. platura* Lignée H", "*D. platura* Lignée N"), values = c("slategray3","burlywood3", "indianred3"))+
+  scale_x_discrete(labels = c("Oignon sec", "Oignon vert"))+
+  labs(y = "Abondance moyenne",
+       x = "") +
+  theme_classic()+
+  theme(legend.text = element_markdown(size = 12),
+        legend.title = element_text(size = 12),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)) +
+  facet_wrap(~year)
+
+mean_abundance_year
+```
+
+
+Year has no effect
+
+ggsave(filename = "mean_abundance_year.png", plot = mean_abundance_year, width = 15, height = 8)
+
+
+
+
+Abundance in OIG sec & vert across fields and years
+
+```{r}
+
+epreds_fields_year <- abundance_full%>%
+  select(species, crop, field_ID, year) %>%
+  distinct() %>%
+  subset(crop %in% c("oignon_sec", "oignon_vert")) %>%
+  add_epred_rvars(mod1_good, re_formula = ~ (1|field_ID) + (1|year)) %>%
+  mutate(year = factor(year, levels = c("2017", "2018", "2019", "2020", "2021", "2022")))
+
+
+
+mean_abundance_fields <- ggplot(epreds_fields_year) +
+  stat_slabinterval(aes( x = crop, fill = species, color = species, ydist = .epred), position = position_dodge(width=1), .width = c(0.5, 0.95), size = 0.002) +
+  scale_fill_manual(name = expression(italic("Delia spp")), labels = c( "*D. florilega*", "*D. platura* Lignée H", "*D. platura* Lignée N"), values = c("slategray3","burlywood3", "indianred3"))+
+  scale_color_manual(name = expression(italic("Delia spp")), labels = c( "*D. florilega*", "*D. platura* Lignée H", "*D. platura* Lignée N"), values = c("slategray3","burlywood3", "indianred3"))+
+  coord_cartesian(ylim = c(0,6)) +
+  scale_x_discrete(labels = c("Oignon sec", "Oignon vert"))+
+  scale_y_continuous(breaks = seq(from = 1, to = 5, by = 1)) +
+  labs(y = "Abondance moyenne",
+       x = "") +
+  theme_classic() +
+  theme(legend.text = element_markdown(size = 12),
+        legend.title = element_text(size = 12),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)) +
+  facet_wrap(~year)
+
+mean_abundance_fields
+```
+
+
+ggsave(filename = "mean_abundance_fields.png", plot = mean_abundance_fields, width = 15, height = 8)
+
+
+# Part 2 graphs for report
+predicted mean oignon vert
+```{r}
+smooth_epred_vert_subset <- oig_vert_subset%>%
+  select(species) %>%
+  distinct() %>%
+  expand_grid(JJ = seq(from = 120, to = 190, by = 5)) %>%
+  add_epred_rvars(mod_smooth_vert_subset, re_formula = NA)
+
+
+oig_vert_plot <- ggplot() +
+  stat_lineribbon(data = smooth_epred_vert_subset, aes(ydist = .epred, x = JJ, color = species, fill = species), alpha = 0.3) +
+  geom_point(data = oig_vert_subset, aes(x = JJ, y = abundance, color = species, fill = species)) +
+  scale_fill_manual(name = expression(italic("Delia spp")), labels = c( "*D. florilega*", "*D. platura* Lignée H", "*D. platura* Lignée N"), values = c("slategray3","burlywood3", "indianred3"))+
+  scale_color_manual(name = expression(italic("Delia spp")), labels = c( "*D. florilega*", "*D. platura* Lignée H", "*D. platura* Lignée N"), values = c("slategray3","burlywood3", "indianred3"))+
+  coord_cartesian(ylim = c(0, 15)) +
+  scale_x_continuous(breaks = seq(from = 120, to = 190, by = 10))+
+  labs(y = "Abondance",
+       x = "Jour de l'année",
+       title = "Oignon vert") +
+  theme_classic()+
+  theme(
+    legend.text = element_markdown(size = 12),
+    legend.title = element_text(size = 12),
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 12),
+    plot.title = element_text(size = 15, hjust = 0.5),
+    legend.position = c(0.8,0.8)
+  ) 
+
+oig_vert_plot
+```
+
+
+predicted mean oignon sec
+```{r}
+smooth_epred_sec_subset <- oig_sec_subset%>%
+  select(species) %>%
+  distinct() %>%
+  expand_grid(JJ = seq(from = 120, to = 190, by = 5)) %>%
+  add_epred_rvars(mod_smooth_sec_subset_good, re_formula = NA)
+
+
+oig_sec_plot <- ggplot() +
+  stat_lineribbon(data = smooth_epred_sec_subset, aes(ydist = .epred, x = JJ, color = species, fill = species), alpha = 0.3) +
+  geom_point(data = oig_sec_subset, aes(x = JJ, y = abundance, color = species, fill = species)) +
+  scale_fill_manual(name = expression(italic("Delia spp")), labels = c( "*D. florilega*", "*D. platura* Lignée H", "*D. platura* Lignée N"), values = c("slategray3","burlywood3", "indianred3"))+
+  scale_color_manual(name = expression(italic("Delia spp")), labels = c( "*D. florilega*", "*D. platura* Lignée H", "*D. platura* Lignée N"), values = c("slategray3","burlywood3", "indianred3"))+
+  coord_cartesian(ylim = c(0, 15)) +
+  scale_x_continuous(breaks = seq(from = 120, to = 190, by = 10))+
+  labs(y = "Abondance",
+       x = "",
+       title = "Oignon sec") +
+  theme_classic()+
+  theme(
+    legend.text = element_markdown(size = 12),
+    legend.title = element_text(size = 12),
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 12),
+    plot.title = element_text(size = 15, hjust = 0.5),
+    legend.position = "none"
+  ) 
+
+oig_sec_plot
+```
+
+Patchwork
+```{r}
+phenology <- oig_sec_plot + oig_vert_plot +
+  plot_layout(ncol = 1, nrow = 2)
+```
+
+ggsave(filename = "phenology.png", plot = phenology, width = 15, height = 8)
+
+
+# change priors on sd
+On 28-07-23, I realized that the prior for the standard deviation of the random effects is on the log scale so an exponential prior does not make sense. It should probably be N(0,3)
+
+Prior predictive checks
+```{r}
+bf_part_1_good <- bf(abundance ~ 0 + species + crop + species*crop + (1|field_ID) + (1|year) + (1|prod_ID),
+                family = negbinomial(link = "log", link_shape = "log"))
+
+prior_part_1.2_2 <- c(
+  prior(normal(1,2), class = "b"),
+  prior(normal(0,3), class = "sd"),
+  prior(exponential(2), class = "shape")
+)
+
+mod1_good_priors <- brm(formula = bf_part_1_good,
+            data = abundance_full,
+            prior = prior_part_1.2_2,
+            sample_prior = "only",
+            iter = 2000, warmup = 1000, chains = 4, cores = 4,
+            seed = 333, control = list(adapt_delta = 0.9),
+            backend = "cmdstanr")
+
+plot(mod1_good_priors)
+
+print(mod1_good_priors)
+
+abundance_full %>% 
+  add_predicted_draws(mod1_good_priors , ndraws = 6) %>% 
+  ggplot(aes(x = abundance, y = .prediction)) + geom_point() + facet_wrap(~.draw, scales = "free")
+```
+The plot(model) suggests that there is a lower bound on sd anyway so the exponential prior might not be that bad
+
+Let's run the new model with data and see if the predictions for the random effects change
+
+```{r}
+mod1_good_new_priors_trial <- brm(formula = bf_part_1_good,
+            data = abundance_full,
+            prior = prior_part_1.2_2,
+            iter = 2000, warmup = 1000, chains = 4, cores = 4,
+            seed = 333, control = list(adapt_delta = 0.9),
+            backend = "cmdstanr",
+            file = "mod1_good_new_priors_trial")
+
+plot(mod1_good_new_priors_trial) # trace plot for year ID is actually weird now
+
+print(mod1_good_new_priors_trial)
+
+
+
+pp_check(mod1_good_new_priors_trial, type = "dens_overlay", ndraws = 100)
+
+
+pp_check(mod1_good_new_priors_trial, type = "stat",stat = "median",  ndraws = 100)
+
+
+pp_check(mod1_good_new_priors_trial, type = "scatter_avg", ndraws = 100)
+
+
+pp_check(mod1_good_new_priors_trial, type = "ecdf_overlay", ndraws = 100)
+
+
+pp_check(mod1_good_new_priors_trial, type = "ribbon", ndraws = 100)
+```
+
+
+
+Abundance in OIG sec & vert across years
+
+```{r}
+
+epreds_years2 <- expand_grid(
+  crop = c("oignon_sec", "oignon_vert"),
+  species = c("H", "N", "florilega"),
+  year = c(2017:2022)
+) %>%
+  add_epred_rvars(mod1_good_new_priors_trial, re_formula = ~(1|year)) %>%
+  mutate(year = factor(year, levels = c("2017", "2018", "2019", "2020", "2021", "2022")))
+
+
+
+mean_abundance_year2 <- ggplot(epreds_years2) +
+  stat_gradientinterval(aes( x = crop, fill = species, color = species, ydist = .epred), position = position_dodge(width=1), .width = c(0.5, 0.95)) +
+  scale_fill_manual(name = expression(italic("Delia spp")), labels = c( "*D. florilega*", "*D. platura* Lignée H", "*D. platura* Lignée N"), values = c("slategray3","burlywood3", "indianred3"))+
+  scale_color_manual(name = expression(italic("Delia spp")), labels = c( "*D. florilega*", "*D. platura* Lignée H", "*D. platura* Lignée N"), values = c("slategray3","burlywood3", "indianred3"))+
+  scale_x_discrete(labels = c("Oignon sec", "Oignon vert"))+
+  labs(y = "Abondance moyenne",
+       x = "") +
+  theme_classic()+
+  theme(legend.text = element_markdown(size = 12),
+        legend.title = element_text(size = 12),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)) +
+  facet_wrap(~year)
+
+mean_abundance_year2
+```
+
+
+Year has no effect
+
+
+Abundance in OIG sec & vert across fields and years
+
+```{r}
+
+epreds_fields_year2 <- abundance_full%>%
+  select(species, crop, field_ID, year) %>%
+  distinct() %>%
+  subset(crop %in% c("oignon_sec", "oignon_vert")) %>%
+  add_epred_rvars(mod1_good_new_priors_trial, re_formula = ~ (1|field_ID) + (1|year)) %>%
+  mutate(year = factor(year, levels = c("2017", "2018", "2019", "2020", "2021", "2022")))
+
+
+
+mean_abundance_fields2 <- ggplot(epreds_fields_year2) +
+  stat_slabinterval(aes( x = crop, fill = species, color = species, ydist = .epred), position = position_dodge(width=1), .width = c(0.5, 0.95), size = 0.002) +
+  scale_fill_manual(name = expression(italic("Delia spp")), labels = c( "*D. florilega*", "*D. platura* Lignée H", "*D. platura* Lignée N"), values = c("slategray3","burlywood3", "indianred3"))+
+  scale_color_manual(name = expression(italic("Delia spp")), labels = c( "*D. florilega*", "*D. platura* Lignée H", "*D. platura* Lignée N"), values = c("slategray3","burlywood3", "indianred3"))+
+  coord_cartesian(ylim = c(0,6)) +
+  scale_x_discrete(labels = c("Oignon sec", "Oignon vert"))+
+  scale_y_continuous(breaks = seq(from = 1, to = 5, by = 1)) +
+  labs(y = "Abondance moyenne",
+       x = "") +
+  theme_classic() +
+  theme(legend.text = element_markdown(size = 12),
+        legend.title = element_text(size = 12),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)) +
+  facet_wrap(~year)
+
+mean_abundance_fields2
+```
+
+So prior did not change anything in terms of predictions BUT the N(0,3) actually caused the model to have some divergent transitions - kinda learned something today I guess?
+
